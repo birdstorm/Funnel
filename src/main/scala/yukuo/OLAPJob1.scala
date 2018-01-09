@@ -1,7 +1,7 @@
 package yukuo
 
 import java.text.{ParseException, SimpleDateFormat}
-import java.util.{Calendar, Date, Properties}
+import java.util.{Calendar, Date}
 
 import com.github.tototoshi.csv.CSVWriter
 import com.typesafe.scalalogging.slf4j.{LazyLogging, Logger}
@@ -18,6 +18,7 @@ class Job extends LazyLogging {
   private var resultFileName = ""
   private var dbName: String = ""
   private var resultDir: String = ""
+  private var startDateTime: String = ""
   private var startOfInputDay: Long = _
   private var startOfInputNextDay: Long = _
   private var startOfInputNext3Days: Long = _
@@ -30,23 +31,22 @@ class Job extends LazyLogging {
     .appName(APP_NAME)
     .getOrCreate()
 
+  private val conf = spark.sqlContext
+
   def initTiContext(): TiContext = {
     val ti = new TiContext(spark)
     ti.tidbMapDatabase(dbName)
     ti
   }
 
-  def loadConf(conf: String): Properties = {
-    val confStream = getClass.getClassLoader.getResourceAsStream(conf)
-    val prop = new Properties()
-    prop.load(confStream)
-    prop
+  def initConfig(): Unit = {
+    startDateTime = conf.getConf(START_DATE, "")
+    resultDir = conf.getConf(OUTPUT_FOLDER, "/")
+    dbName = conf.getConf(DB_NAME, "chiji_db")
   }
 
-  def initConfig(): Unit = {
-    val prop: Properties = loadConf(CONFIG_NAME)
-    resultDir = prop.getOrDefault(OUTPUT_FOLDER, "/").toString
-    dbName = prop.getOrDefault(DB_NAME, "chiji_db").toString
+  def setConfig(key: String, value: String): Unit = {
+    conf.setConf(key, value)
   }
 
   def calculateTime(inputDate: Date): Unit = {
@@ -62,11 +62,11 @@ class Job extends LazyLogging {
     logger.info("startOfInputNext3Days:" + startOfInputNext3Days)
   }
 
-  def prepareTime(t: String): Unit = {
+  def prepareTime(): Unit = {
     val dateFormat = new SimpleDateFormat("yyyyMMdd")
 
     var inputDate: Date = null
-    var inputDateStr = t
+    var inputDateStr = startDateTime
     do {
       try {
         inputDate = dateFormat.parse(inputDateStr)
@@ -82,10 +82,10 @@ class Job extends LazyLogging {
     calculateTime(inputDate)
   }
 
-  def run(t: String): Unit = {
+  def run(): Unit = {
     time {
-      prepareTime(t)
       initConfig()
+      prepareTime()
       initTiContext()
       doJob()
     }(logger, "Total run time for app:" + APP_NAME)
@@ -172,8 +172,8 @@ class Job extends LazyLogging {
 
     // Meaning of this order map is :
     // We are to calculate answer of number of users having events with the following in time order:
-    // (1) -> (2, 3) -> (4, 5) -> (8, 9)
-    // orderMap[3] = 2 means event(3) is in the 2nd order of event chain
+    // (1) -> (2, 3) -> (4, 5) -> (8) -> (9)
+    // orderMap[3] = 1 means event(3) is in the 2nd order of event chain
     // note that event (6) is in cancelMap, it will cancel all events from cancelMap[6] -> orderMap[6]
     val orderMap: Map[Long, Int] = Map(
       1L -> 0,
@@ -181,7 +181,7 @@ class Job extends LazyLogging {
       3L -> 1,
       4L -> 2,
       5L -> 2,
-      6L -> 4, // orderMap[6] = 4 with cancelMap[6] = 1 means event 6 will cancel all events from chain #1 to #4
+      6L -> 4, // orderMap[6] = 4 with cancelMap[6] = 1 means event 6 will cancel all events from chain #1 to #4 [2,3,4,5,8,9]
       8L -> 3,
       9L -> 4
     )
@@ -285,10 +285,8 @@ class Job extends LazyLogging {
   }
 
   def writeToFile(df: DataFrame): Unit = {
-    val prop: Properties = loadConf(CONFIG_NAME)
-    resultFileName = prop
-      .getOrDefault(RESULT_FILE_NAME, s"${new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date())}_job_result_from_$startOfInputDay.csv")
-      .toString
+    resultFileName = conf
+      .getConf(RESULT_FILE_NAME, s"${new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date())}_job_result_from_$startOfInputDay.csv")
     initWriter()
     val result = ArrayBuffer.empty[ArrayBuffer[Any]]
     val title = ArrayBuffer.empty[Any]
@@ -337,8 +335,20 @@ class Job extends LazyLogging {
 
 object OLAPJobRunner {
   def main(args: Array[String]): Unit = {
-    if (args.length >= 1) {
-      new Job().run(args(0))
+    var check = !args.isEmpty
+    val job = new Job()
+    for (keyVal <- args) {
+      val u = keyVal.split("=")
+      if (u.length != 2) {
+        check = false
+      } else {
+        val key = u(0)
+        val value = u(1)
+        job.setConfig(key, value)
+      }
+    }
+    if (check) {
+      job.run()
 //      Thread.sleep(1000000000000L)
     } else {
       print("no time value found")
