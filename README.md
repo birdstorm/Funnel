@@ -6,7 +6,7 @@
 5. cd到spark所在目录，配置好tispark环境，参考[这里](https://github.com/pingcap/tispark).
 6. 执行spark-submit命令：
 ```bash
-./bin/spark-submit --class yukuo.OLAPJobRunner /存放此jar的路径/yukuo.spark-1.0-SNAPSHOT-jar-with-dependencies.jar
+./bin/spark-submit --class yukuo.OLAPJobRunner /存放此jar的路径/yukuo.spark-1.0-SNAPSHOT-jar-with-dependencies.jar yyyyMMdd
 ```
 7. 之后程序会开始运行，弹出以下提示
 ```bash

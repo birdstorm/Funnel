@@ -128,20 +128,19 @@ class Job extends LazyLogging {
   }
 
   def fetchDayOne(): DataFrame = {
-    // order by time because we may get strange results with select if we use index
+    // maybe we need to order by time because we may get strange results with select if we use index
     time {
       val df = spark.sql(
         s"""select *
-           | from log3 where dayid = 1 order by time""".stripMargin)
+           | from log3 where dayid = 1""".stripMargin)
       df.cache()
       logger.info("OLAP sql 1 get all data count:" + df.count())
       df
     }(logger, "OLAP sql 1")
   }
 
-  // not used
-  @deprecated
-  def groupByPlayerUId(): mutable.HashSet[Long] = {
+//  def groupByPlayerUId(): mutable.HashSet[Long] = {
+  def groupByPlayerUId(): DataFrame = {
     time {
       val df = spark.sql(
         s"""select distinct(playerUId) playerUId
@@ -149,9 +148,10 @@ class Job extends LazyLogging {
       df.cache()
       logger.info("OLAP sql 2 playerUId count:" + df.count())
       df.createOrReplaceTempView("players")
-      var ret: mutable.HashSet[Long] = mutable.HashSet()
-      df.collect().foreach((f: Row) => ret += f.get(0).asInstanceOf[Long])
-      ret
+      df
+//      var ret: mutable.HashSet[Long] = mutable.HashSet()
+//      df.collect().foreach((f: Row) => ret += f.get(0).asInstanceOf[Long])
+//      ret
     }(logger, "OLAP sql 2")
   }
 
@@ -161,8 +161,14 @@ class Job extends LazyLogging {
 
   def runOLAP(): Unit = {
 
-    //sql 1
+    // sql 1 create DataFrame
     var df: DataFrame = fetchDayOne()
+
+    // sql 2
+    val df2: DataFrame = groupByPlayerUId()
+
+    // count number of playerUIds
+    val countPlayerUId: Int = df2.count().asInstanceOf[Int]
 
     // Meaning of this order map is :
     // We are to calculate answer of number of users having events with the following in time order:
@@ -175,7 +181,7 @@ class Job extends LazyLogging {
       3L -> 1,
       4L -> 2,
       5L -> 2,
-      6L -> 3,
+      6L -> 4, // orderMap[6] = 4 with cancelMap[6] = 1 means event 6 will cancel all events from chain #1 to #4
       8L -> 3,
       9L -> 4
     )
@@ -184,6 +190,12 @@ class Job extends LazyLogging {
       6L -> 1
     )
 
+    // max event chain length
+    val eventLength = 10
+    // max game count
+    val maxGameCount = 5
+
+    // rdd reformat original data to (playerUId, (time, eventId))
     val rdd: RDD[(Long, (Long, Long))] = df.rdd.map((row: Row) => {
       for (i <- 0 until row.length)
         print(row.get(i) + " ")
@@ -191,47 +203,72 @@ class Job extends LazyLogging {
       (row.getAs[Long](2), (row.getAs[Long](1), row.getAs[Long](4)))
     }).persist()
 
-    val rdd2: RDD[(Long, Iterable[(Long, Long)])] = rdd.groupByKey().sortBy(_._2).persist()
+    // rdd2 group rdd by playerUId and sort by time
+    // TODO: groupByKey is not safe if data is not balanced
+    val rdd2: RDD[(Long, Iterable[(Long, Long)])] = rdd.repartition(countPlayerUId).groupByKey().sortBy(_._2).persist()
 
+    // rdd3 do logic on each partition
+    // result RDD will be (playerUId, Array(i ∈ N) which represents whether event chain #i is reached)
     val rdd3: RDD[(Long, Array[Long])] = rdd2.mapPartitions(
       (it: Iterator[(Long, Iterable[(Long, Long)])]) => {
         var ans = Array.empty[(Long, Array[Long])]
         it.foreach((f: (Long, Iterable[(Long, Long)])) => {
-          val ret = Array.fill(10)(0L)
+          // calculate for each playerUId
+          val ret = Array.fill(eventLength * maxGameCount)(0L)
           val pid = f._1.asInstanceOf[Long]
+          // game Id indicates the number of game of same user in this day
+          var gameId = 0
           var tail = 0
           f._2.foreach((g: (Long, Long)) => {
             val logType = g._2.asInstanceOf[Long]
             val eventId = orderMap.get(logType)
             val jumpBack = cancelMap.get(logType)
+            // lastGameIdx can be changed by gameId or anything else.
+            var lastGameIdx = (gameId + 1) * (eventLength - 1)
             println("get data: " + g)
-            eventId match {
+            // here is a simple logic calculates first game for each user
+            // change by editing if-clause logic
+            // here ret(lastGameIdx) == 0 indicates the first game is over.
+            // you can add more games by adding offset for orderMap and cancelMap values
+            // for example ret(0..5) is first game, ret(6..10) is second game, etc.
+            // change lastGameIdx value to support more games in same day
+            // we may simply update gameId when we reach `ret(lastGameIdx) > 0`
+            // and don't forget to clear ret array for a new game.
+            if (ret(lastGameIdx) == 0) eventId match {
               case Some(id) =>
                 jumpBack match {
                   case Some(toPrev) =>
-                    if (toPrev < tail) {
+                    // Question: if event chain is 123456 ,
+                    // event 12345 has finished and a cancel occurs for 3 to jump back to 2
+                    // will it cancel events 4 and 5 ?
+                    if (id >= tail && toPrev < tail) {
+                      // clear events from toPrev to tail
                       for (i <- toPrev until tail) {
                         ret(i) = 0
                       }
+                      // reset tail
                       tail = toPrev
                     }
                   case None =>
-                    if (id == 0 || (id > 0 /*&& ret(id) == 0 */ && ret(id - 1) > 0)) {
+                    if (id == 0 || (id > 0 && ret(id) == 0  && ret(id - 1) > 0)) {
                       ret(id) = 1
-                      tail = Math.max(tail, id)
+                      tail = Math.max(tail, id + 1)
                     }
                 }
               case None =>
               // invalid event
             }
           })
-          println("get partial result for " + pid + ": " + ret.map((x: Long) => x + " "))
+          val partialOutput = ret.mkString("[", ",", "]")
+          println("get partial result for " + pid + ": " + partialOutput)
           ans = ans.:+(pid, ret)
         })
         ans.iterator
       }
     )
 
+    // calculate answer for all users
+    // result will be (playerUId, answer array)
     val rdd4 = rdd3.reduceByKey((a, b) => {
       val ret = Array.ofDim[Long](a.length)
       for (i <- a.indices) {
