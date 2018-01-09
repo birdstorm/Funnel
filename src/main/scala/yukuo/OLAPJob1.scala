@@ -224,7 +224,7 @@ class Job extends LazyLogging {
             val eventId = orderMap.get(logType)
             val jumpBack = cancelMap.get(logType)
             // lastGameIdx can be changed by gameId or anything else.
-            var lastGameIdx = (gameId + 1) * (eventLength - 1)
+            var lastGameIdx = (gameId + 1) * eventLength - 1
             println("get data: " + g)
             // here is a simple logic calculates first game for each user
             // change by editing if-clause logic
